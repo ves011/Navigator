@@ -1,4 +1,5 @@
 idf_component_register(SRCS "main.c"
+							"process_mesage.c"
                         	"../../esp32_common/tcp/ntp_sync.c"
 							"../../esp32_common/utils/utils.c"
 							"../../esp32_common/utils/ota.c"

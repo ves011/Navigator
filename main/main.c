@@ -40,8 +40,10 @@
 #include "hal/adc_types.h"
 #include "gpios.h"
 #include "nmea_parser.h"
-#include "gp.h"
 #include "tcp_server.h"
+
+#include "esp_private/panic_internal.h"
+//#include "port/panic_funcs.h"
 
 //#include "driver/adc.h"
 //#include "esp_adc_cal.h"
@@ -115,7 +117,7 @@ void app_main(void)
 	//register_gpio();
 	esp_log_set_vprintf(my_log_vprintf);
 	sync_NTP_time();
-    
+
 #ifdef WITH_CONSOLE
 #if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) || defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
