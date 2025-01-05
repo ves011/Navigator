@@ -16,7 +16,7 @@
 #if(TEST_BUILD == 1)
 	#define WITH_CONSOLE
 	#define TEST1
-	#define CTRL_DEV_ID					(100)
+	#define CTRL_DEV_ID					(99)
 #else
 	#define CTRL_DEV_ID					(1)
 #endif

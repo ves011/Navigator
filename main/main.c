@@ -36,11 +36,14 @@
 #include "utils.h"
 #include "tcp_log.h"
 #include "ntp_sync.h"
+#include "mqtt_ctrl.h"
 #include "esp_ota_ops.h"
 #include "hal/adc_types.h"
 #include "gpios.h"
 #include "nmea_parser.h"
 #include "tcp_server.h"
+#include "ptst.h"
+#include "adc_op.h"
 
 #include "esp_private/panic_internal.h"
 //#include "port/panic_funcs.h"
@@ -85,11 +88,17 @@ void app_main(void)
 	setenv("TZ","EET-2EEST,M3.4.0/03,M10.4.0/04",1);
 	spiffs_storage_check();
 	initialize_nvs();
+	controller_op_registered = 0;
 	
 	wifi_join(DEFAULT_SSID, DEFAULT_PASS, JOIN_TIMEOUT_MS);
 	if(rw_console_state(PARAM_READ, &console_state) == ESP_FAIL)
 		console_state = CONSOLE_ON;
-	
+	tcp_log_evt_queue = NULL;
+	tcp_log_init();
+	esp_log_set_vprintf(my_log_vprintf);
+	//sync_NTP_time();
+	if(mqtt_start() != ESP_OK)
+		esp_restart();
 #ifdef WITH_CONSOLE
 	esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -113,10 +122,10 @@ void app_main(void)
 	register_wifi();
 	register_tcp_server();
 	register_nmea();
-
-	//register_gpio();
-	esp_log_set_vprintf(my_log_vprintf);
 	sync_NTP_time();
+	register_ad();
+	register_ptst();
+	controller_op_registered = 1;
 
 #ifdef WITH_CONSOLE
 #if defined(CONFIG_ESP_CONSOLE_UART_DEFAULT) || defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)

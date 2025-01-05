@@ -1,1 +1,4 @@
 /wifi_credentials.h
+/ca.crt
+/client.crt
+/client.key
