@@ -17,6 +17,8 @@
 	#define WITH_CONSOLE
 	#define TEST1
 	#define CTRL_DEV_ID					(99)
+	#define LOG_SERVER_DEV				"vs-notebook.gnet"
+	#define LOG_PORT_DEV				5556
 #else
 	#define CTRL_DEV_ID					(1)
 #endif
@@ -28,9 +30,11 @@
 #define MDNSINSTANCENAME	DEV_NAME
 #define TCPCOMMPORT			10001
 
+#define BAT_ADC_CHANNEL		3
 
-#define WIFI_STA_ON 					(1)
-#define MQTT_PUBLISH					(0)
+
+#define WIFI_STA_ON 		(1)
+#define MQTT_PUBLISH		(0)
 
 #define TCP_CLIENT_SERVER
 

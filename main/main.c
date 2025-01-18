@@ -25,6 +25,7 @@
 #include "wear_levelling.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "linenoise/linenoise.h"
 #include "esp_netif.h"
 #include "lwip/sockets.h"
@@ -40,10 +41,14 @@
 #include "esp_ota_ops.h"
 #include "hal/adc_types.h"
 #include "gpios.h"
+#include "i2ccomm.h"
 #include "nmea_parser.h"
 #include "tcp_server.h"
 #include "ptst.h"
 #include "adc_op.h"
+#include "hmc5883.h"
+#include "mpu6050.h"
+#include "vl53l0x.h"
 
 #include "esp_private/panic_internal.h"
 //#include "port/panic_funcs.h"
@@ -86,6 +91,19 @@ void app_main(void)
 	{
 	console_state = CONSOLE_OFF;
 	setenv("TZ","EET-2EEST,M3.4.0/03,M10.4.0/04",1);
+	gpio_config_t io_conf;
+	gpio_install_isr_service(0);
+	io_conf.intr_type = GPIO_INTR_DISABLE;
+	io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask =  ( 1ULL << NW_CONNECT_ON 		| 1ULL << NW_CONNECT_OFF 
+    						| 1ULL << REMOTE_CONNECT_ON 	| 1ULL << REMOTE_CONNECT_OFF); 
+    io_conf.pull_down_en = 0;
+    io_conf.pull_up_en = 0;
+    gpio_config(&io_conf);
+    gpio_set_level(NW_CONNECT_ON, 0);
+    gpio_set_level(NW_CONNECT_OFF, 1);
+    gpio_set_level(REMOTE_CONNECT_ON, 0);
+    gpio_set_level(REMOTE_CONNECT_OFF, 1);
 	spiffs_storage_check();
 	initialize_nvs();
 	controller_op_registered = 0;
@@ -118,6 +136,7 @@ void app_main(void)
 #endif
 #endif
 	esp_console_register_help_command();
+	init_i2c();
 	register_system();
 	register_wifi();
 	register_tcp_server();
@@ -125,6 +144,9 @@ void app_main(void)
 	sync_NTP_time();
 	register_ad();
 	register_ptst();
+	register_hmc();
+	register_mpu();
+	register_vl();
 	controller_op_registered = 1;
 
 #ifdef WITH_CONSOLE
