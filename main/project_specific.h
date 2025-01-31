@@ -17,7 +17,7 @@
 	#define WITH_CONSOLE
 	#define TEST1
 	#define CTRL_DEV_ID					(99)
-	#define LOG_SERVER_DEV				"vs-notebook.gnet"
+	#define LOG_SERVER_DEV				"proxy.gnet"
 	#define LOG_PORT_DEV				5556
 #else
 	#define CTRL_DEV_ID					(1)

@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include "esp_timer.h"
 #include "hal/gpio_types.h"
 #include "sdkconfig.h"
 #include "esp_log.h"
@@ -48,16 +49,36 @@ static int pwm_f = 20; 	// GA25Y310 DC gear motor
 						// the highest frequency for which the torque at low speed is acceptable 
 						// for higher frequencies is very small
 static int lpwm_dc = 50, rpwm_dc = 50;
-static float lr_dc_ratio = 1.;
+static float lr_dc_ratio_fwd = 1.;
+static float lr_dc_ratio_back = 1.;
 
 static uint32_t left_ctrl1 = 0, left_ctrl2 =0, right_ctrl1 = 0, right_ctrl2 = 0;
-static int ledc_timer_res = LEDC_TIMER_11_BIT;
+static int ledc_timer_res = LEDC_TIMER_13_BIT;
 
 static QueueHandle_t pt_mon_queue = NULL;
 static TaskHandle_t pt_mon_task_handle;
 
+extern int bat_val;
+
 int ptst_save_params();
 int ptst_read_params();
+//y = -0.0131x3 + 1.8636x2 - 50.18x + 1307.9
+static float fwd_lrdc(int s)
+	{
+	float x = (float)s;
+	//return (-0.0131 * x * x * x + 1.8636 * x * x -50.18 * x + 1307.9) / 1000;
+	if(x < 50.)
+		return 1.;
+	return (1000. + (x - 50) * 5.) / 1000.;
+	}
+	
+//y = 0.0071x3 - 0.5394x2 + 6.7107x + 735.48
+static float bwd_lrdc(int s)
+	{
+	float x = (float)s;
+	//return (0.071 * x * x * x - 0.5394 * x * x +6.7107 * x + 735.48) / 1000;
+	return (-0.0013 * x * x * x + 0.2483 * x * x - 6.7822 * x + 1108.) / 1000.;
+	}
 
 static void IRAM_ATTR moten_isr_handler(void* arg)
 	{
@@ -92,6 +113,8 @@ static void config_ptst_gpio()
     gpio_config(&io_conf);
     gpio_isr_handler_add(MOTEN_INTR, moten_isr_handler, NULL);
     
+    //LEDC_CHANNEL_0 --> left motor
+    //LEDC_CHANNEL_1 --> right motor
     ledc_timer_config_t ledc_timer = 
     	{
         .speed_mode       = LEDC_LOW_SPEED_MODE,
@@ -107,13 +130,15 @@ static void config_ptst_gpio()
         .channel        = LEDC_CHANNEL_0,
         .timer_sel      = LEDC_TIMER_0,
         .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = ENLEFTM,
+        //.gpio_num       = ENLEFTM, //non blocking mode
+        .gpio_num		= LEFTM_CTRL1, // blocking mode
         .duty           = 0, // Set duty to 0%
         .hpoint         = 0
     	};
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     ledc_channel.channel = LEDC_CHANNEL_1;
-    ledc_channel.gpio_num = ENRIGHTM;
+    //ledc_channel.gpio_num = ENRIGHTM; // non blocking mode
+    ledc_channel.gpio_num = RIGHTM_CTRL1; // blocking mode
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
     ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
     ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
@@ -135,6 +160,7 @@ static void config_ptst_gpio()
 
 int do_ptst(int argc, char **argv)
 	{
+	float lr_dcr;
 	if(strcmp(argv[0], command))
 		return 0;
 	int nerrors = arg_parse(argc, argv, (void **)&ptst_args);
@@ -186,42 +212,100 @@ int do_ptst(int argc, char **argv)
 	
 	else if(strcmp(ptst_args.op->sval[0], "f") == 0)
 		{
+		int t1, t2;
 		if(ptst_args.arg->count)
 			{
+			lr_dcr = fwd_lrdc(ptst_args.arg->ival[0]); //lr_dc_ratio_fwd; //fwd_lrdc(ptst_args.arg->ival[0]);
+			t1 = ptst_args.arg->ival[0];
+			if((float)t1 * lr_dcr >= 100.)
+				{
+				t2 = 100;
+				t1 = (float)t2 / lr_dcr;
+				}
+			else
+				t2 = (float)t1 * lr_dcr;
 			left_ctrl1 = 1;
 			left_ctrl2 = 0;
 			right_ctrl1 = 1;
 			right_ctrl2 = 0;
-			lpwm_dc = (ptst_args.arg->ival[0] << ledc_timer_res) / 100; 
-			rpwm_dc = (int)((float)lpwm_dc * lr_dc_ratio);
+			lpwm_dc = (t1 << ledc_timer_res) / 100; 
+			rpwm_dc = (t2 << ledc_timer_res) / 100;
+
 			ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, lpwm_dc);
 			ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, rpwm_dc);
 			ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 			ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+			/*
+			//non blocking mode
 			gpio_set_level(LEFTM_CTRL1, left_ctrl1);
 			gpio_set_level(LEFTM_CTRL2, left_ctrl2);
 			gpio_set_level(RIGHTM_CTRL1, right_ctrl1);
 			gpio_set_level(RIGHTM_CTRL2, right_ctrl2);
+			*/
+			//blocking mode
+			gpio_set_level(LEFTM_CTRL2, 0);
+			gpio_set_level(RIGHTM_CTRL2, 0);
+			if(ptst_args.arg->ival[0] == 0)
+				{
+				gpio_set_level(ENLEFTM, 0);
+				gpio_set_level(ENRIGHTM, 0);
+				}
+			else 
+				{
+				gpio_set_level(ENLEFTM, 1);
+				gpio_set_level(ENRIGHTM, 1);
+				}
+			
+			uint64_t ts = esp_timer_get_time();
+			my_printf("%10llu - fwd %d bat: %d (%f: %d %d)", ts, ptst_args.arg->ival[0], bat_val, lr_dc_ratio_fwd, lpwm_dc, rpwm_dc);
 			}
 		}
 	else if(strcmp(ptst_args.op->sval[0], "b") == 0)
 		{
+		int t1, t2;
 		if(ptst_args.arg->count)
 			{
+			lr_dcr = bwd_lrdc(ptst_args.arg->ival[0]); //lr_dc_ratio_back; //
+			t1 = 100 - ptst_args.arg->ival[0];
+			if((float)t1 * lr_dcr >= 100.)
+				{
+				t2 = 100;
+				t1 = (float)t2 / lr_dcr;
+				}
+			else
+				t2 = (float)t1 * lr_dcr;
 			left_ctrl1 = 0;
 			left_ctrl2 = 1;
 			right_ctrl1 = 0;
 			right_ctrl2 = 1;
-			lpwm_dc = (ptst_args.arg->ival[0] << ledc_timer_res) / 100; 
-			rpwm_dc = (int)((float)lpwm_dc * lr_dc_ratio);
+			lpwm_dc = (t1 << ledc_timer_res) / 100; 
+			rpwm_dc = (t2 << ledc_timer_res) / 100;
 			ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, lpwm_dc);
 			ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, rpwm_dc);
 			ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 			ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+			/*
+			//non blocking mode
 			gpio_set_level(LEFTM_CTRL1, left_ctrl1);
 			gpio_set_level(LEFTM_CTRL2, left_ctrl2);
 			gpio_set_level(RIGHTM_CTRL1, right_ctrl1);
 			gpio_set_level(RIGHTM_CTRL2, right_ctrl2);
+			*/
+			//blocking mode
+			gpio_set_level(LEFTM_CTRL2, 1);
+			gpio_set_level(RIGHTM_CTRL2, 1);
+			if(ptst_args.arg->ival[0] == 0)
+				{
+				gpio_set_level(ENLEFTM, 0);
+				gpio_set_level(ENRIGHTM, 0);
+				}
+			else 
+				{
+				gpio_set_level(ENLEFTM, 1);
+				gpio_set_level(ENRIGHTM, 1);
+				}
+			uint64_t ts = esp_timer_get_time();
+			my_printf("%10llu - back %d bat: %d (%f: %d %d)", ts, ptst_args.arg->ival[0], bat_val, lr_dc_ratio_back, lpwm_dc, rpwm_dc);
 			}
 		}
 	else if(strcmp(ptst_args.op->sval[0], "l") == 0)
@@ -264,6 +348,7 @@ int do_ptst(int argc, char **argv)
 			gpio_set_level(RIGHTM_CTRL2, right_ctrl2);
 			}
 		}
+	/*
 	else if(strcmp(ptst_args.op->sval[0], "lrdc") == 0)
 		{
 		if(ptst_args.arg->count)
@@ -273,6 +358,27 @@ int do_ptst(int argc, char **argv)
 			}
 		else
 			ESP_LOGI(TAG, "lr_dc_ratio: %f", lr_dc_ratio);
+		}
+	*/
+	else if(strcmp(ptst_args.op->sval[0], "lrdcf") == 0)
+		{
+		if(ptst_args.arg->count)
+			{
+			lr_dc_ratio_fwd = (float)ptst_args.arg->ival[0] / 1000.;
+			ptst_save_params();
+			}
+		else
+			ESP_LOGI(TAG, "lr_dc_ratio: %f", lr_dc_ratio_fwd);
+		}
+	else if(strcmp(ptst_args.op->sval[0], "lrdcb") == 0)
+		{
+		if(ptst_args.arg->count)
+			{
+			lr_dc_ratio_back = (float)ptst_args.arg->ival[0] / 1000.;
+			ptst_save_params();
+			}
+		else
+			ESP_LOGI(TAG, "lr_dc_ratio: %f", lr_dc_ratio_back);
 		}
 	return ESP_OK;
 	}
@@ -322,7 +428,7 @@ static void pt_mon_task(void *pvParameters)
 void register_ptst()
 	{
 	ptst_args.op = arg_str1(NULL, NULL, "<op>", "op: f | b | l | r | s | fr | dc");
-	ptst_args.arg = arg_int1(NULL, NULL, "<speed> | <angle>", "channel to read");
+	ptst_args.arg = arg_int0(NULL, NULL, "<speed> | <angle>", "channel to read");
 	ptst_args.end = arg_end(1);
 	const esp_console_cmd_t ptst_cmd =
 		{
@@ -352,7 +458,7 @@ int ptst_save_params()
 		ESP_LOGE(TAG, "Failed to create console %s", PTST_FILE);
 	else
 		{
-		sprintf(buf, "%f\n", lr_dc_ratio);
+		sprintf(buf, "%f\n%f\n", lr_dc_ratio_fwd, lr_dc_ratio_back);
 		if(fputs(buf, f) >= 0)
 			ret = ESP_OK;
 		fclose(f);
@@ -366,7 +472,7 @@ int ptst_read_params()
 	if (stat(BASE_PATH"/"CONSOLE_FILE, &st) != 0)
 		{
 		// file does no exists
-		ESP_LOGI(TAG, "%s not found. Return default parameters: lr_dc_ratio = %f", PTST_FILE, lr_dc_ratio);
+		ESP_LOGI(TAG, "%s not found. Return default parameters: lr_dc_ratio_fwd = %f lr_dc_ratio_back = %f", PTST_FILE, lr_dc_ratio_fwd, lr_dc_ratio_back);
 		}
 	else
 		{
@@ -375,16 +481,29 @@ int ptst_read_params()
 			{
 			if(fgets(buf, 48, f))
 				{
-				lr_dc_ratio = atof(buf);
+				lr_dc_ratio_fwd = atof(buf);
+				if(fgets(buf, 48, f))
+					lr_dc_ratio_back = atof(buf);
+				else
+ 					{
+					lr_dc_ratio_back = lr_dc_ratio_fwd = 1.;
+					ESP_LOGI(TAG, "%s read error. Return default parameters: lr_dc_ratio_fwd = %f lr_dc_ratio_back = %f", 
+					PTST_FILE, lr_dc_ratio_fwd, lr_dc_ratio_back);
+					}
 				}
 			else
  				{
-				ESP_LOGI(TAG, "%s read error. Return default parameters: lr_dc_ratio = %f", PTST_FILE, lr_dc_ratio);	 
+				lr_dc_ratio_back = lr_dc_ratio_fwd = 1.;
+				ESP_LOGI(TAG, "%s read error. Return default parameters: lr_dc_ratio_fwd = %f lr_dc_ratio_back = %f", 
+					PTST_FILE, lr_dc_ratio_fwd, lr_dc_ratio_back);	 
 				}
+			fclose(f);
 			}
 		else
 			{
-			ESP_LOGI(TAG, "%s cannot open for read. Return default parameters: lr_dc_ratio = %f", PTST_FILE, lr_dc_ratio);	 
+			lr_dc_ratio_back = lr_dc_ratio_fwd = 1.;
+			ESP_LOGI(TAG, "%s cannot open for read. Return default parameters: lr_dc_ratio_fwd = %f lr_dc_ratio_back = %f", 
+				PTST_FILE, lr_dc_ratio_fwd, lr_dc_ratio_back);	 
 			}
 		}
 	return ESP_OK;

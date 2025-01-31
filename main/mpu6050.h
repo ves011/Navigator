@@ -77,6 +77,15 @@
 #define FIFO_R_W			0x74
 #define WHO_AM_I		 	0x75 // Should return 0x68
 
+//upside up calibration factors
+#define CAL_FACT_AX			-0.06201215			
+#define CAL_FACT_AY			0.05024985
+#define CAL_FACT_AZ			-0.85725295
+
+#define CAL_FACT_GX			-3.820497563
+#define CAL_FACT_GY			1.207427063
+#define CAL_FACT_GZ			0.920870188
+
 #define TO_INT(a, b)		(int16_t)(((int16_t)a << 8) | b)
 
 void register_mpu();

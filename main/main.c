@@ -49,6 +49,7 @@
 #include "hmc5883.h"
 #include "mpu6050.h"
 #include "vl53l0x.h"
+#include "navi_mon.h"
 
 #include "esp_private/panic_internal.h"
 //#include "port/panic_funcs.h"
@@ -66,6 +67,7 @@ console_state_t console_state;
 
 int restart_in_progress;
 int controller_op_registered;
+QueueHandle_t dev_mon_queue = NULL;
 
 static void initialize_nvs(void)
 	{
@@ -106,9 +108,15 @@ void app_main(void)
     gpio_set_level(REMOTE_CONNECT_OFF, 1);
 	spiffs_storage_check();
 	initialize_nvs();
+	if(xTaskCreate(navi_mon_task, "navi mon task", 8192, NULL, 5, NULL) != pdPASS)
+		{
+		ESP_LOGE("NAVI", "Cannot create navi_mon_task task");
+		esp_restart();
+		}
 	controller_op_registered = 0;
 	
 	wifi_join(DEFAULT_SSID, DEFAULT_PASS, JOIN_TIMEOUT_MS);
+	
 	if(rw_console_state(PARAM_READ, &console_state) == ESP_FAIL)
 		console_state = CONSOLE_ON;
 	tcp_log_evt_queue = NULL;
@@ -117,6 +125,7 @@ void app_main(void)
 	//sync_NTP_time();
 	if(mqtt_start() != ESP_OK)
 		esp_restart();
+	
 #ifdef WITH_CONSOLE
 	esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();

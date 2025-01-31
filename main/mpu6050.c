@@ -15,6 +15,7 @@
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
 #include "driver/i2c_master.h"
+#include "esp_timer.h"
 #include "freertos/projdefs.h"
 #include "hal/gpio_types.h"
 #include "esp_netif.h"
@@ -27,6 +28,7 @@
 #include "utils.h"
 #include "i2ccomm.h"
 #include "gpios.h"	
+#include "kalman.h"
 #include "mpu6050.h"
 
 static struct
@@ -48,23 +50,14 @@ static int acc_fs, gyro_fs;
 static float acc_res, gyro_res;
 
 //means used to reduce the offsets
-static int mac_x, mac_y, mac_z, mgy_x, mgy_y, mgy_z;
+static float mac_x, mac_y, mac_z, mgy_x, mgy_y, mgy_z;
 
-static float err_m = 2., err_e = 2., p_noise = 0.1;
+static float def_err_m = 1., def_err_e = 1., def_p_noise = 0.5;
 
-static float err_m_ax = 2., err_e_ax = 2., p_noise_ax = 0.01;
-static float err_m_ay = 2., err_e_ay = 2., p_noise_ay = 0.01;
-static float err_m_az = 2., err_e_az = 2., p_noise_az = 0.01;
-static float l_est_ax = 0, k_gain_ax = 0;
-static float l_est_ay = 0, k_gain_ay = 0;
-static float l_est_az = 0, k_gain_az = 0;
+static ks_filter_t kf_ax, kf_ay, kf_az;
+static ks_filter_t kf_gx, kf_gy, kf_gz;
 
-static void kf_init_ax(float m_error, float e_error, float pn);
-static float update_est_ax(float m);
-static void kf_init_ay(float m_error, float e_error, float pn);
-static float update_est_ay(float m);
-static void kf_init_az(float m_error, float e_error, float pn);
-static float update_est_az(float m);
+
 
 static void IRAM_ATTR mpu_drdy_isr(void* arg)
 	{
@@ -73,6 +66,7 @@ static void IRAM_ATTR mpu_drdy_isr(void* arg)
     if(gpio_num == MPU_DRDY_PIN)
     	{
 		msg.source = 1;
+		msg.vts.ts = esp_timer_get_time();
 		xQueueSendFromISR(mpu_cmd_queue, &msg, NULL);
 		}
 	}
@@ -197,7 +191,7 @@ static int mpu_init()
 			 	wr_buf[1] = 100;
 			 	if((ret = master_transmit(mpu_handle, wr_buf, 2)) != ESP_OK)
 			 		goto error;
-			 	//CONFIG: fsync disabled, dlpf = 4 --> 0x04
+			 	//CONFIG: fsync disabled, dlpf = 6 --> 0x06
 			 	wr_buf[0] = CONFIG;
 			 	wr_buf[1] = 0x06;
 			 	//if((ret = master_transmit(mpu_handle, wr_buf, 2)) != ESP_OK)
@@ -244,10 +238,9 @@ void mpu_message_handler(void *pvParameters)
 	msg_t msg;
 	uint8_t wr_buf, rd_buf[20];
 	int tac_x, tac_y, tac_z, tgy_x, tgy_y, tgy_z;
-	int *rac_x, *rac_y, *rac_z, *rgy_x, *rgy_y, *rgy_z; 
 	int rtemp, samples = 0;
 	int nr_samples = 5;
-	int cal_state = 0, calibrated = 0;
+	int cal_state = 0, calibrated = 1;
 	while(1)
 		{
 		if(xQueueReceive(mpu_cmd_queue, &msg, pdMS_TO_TICKS(1500)))
@@ -269,31 +262,52 @@ void mpu_message_handler(void *pvParameters)
 	 			tgy_x = (int16_t)(((int16_t)rd_buf[8] << 8) | (int)rd_buf[9]);
 	 			tgy_y = (int16_t)(((int16_t)rd_buf[10] << 8) | (int)rd_buf[11]);
 	 			tgy_z = (int16_t)(((int16_t)rd_buf[12] << 8) | (int)rd_buf[13]);
-	 			//if(!calibrated)
-	 				//ESP_LOGI(TAG, "raw accel: %6d %6d %6d %6d raw gyro : %6d %6d %6d ",	tac_x, tac_y, tac_z, rtemp, tgy_x, tgy_y, tgy_z);
+	 			if(!calibrated)
+	 				ESP_LOGI(TAG, "raw accel: %6d %6d %6d %6d raw gyro : %6d %6d %6d ",	tac_x, tac_y, tac_z, rtemp, tgy_x, tgy_y, tgy_z);
 	 			if(calibrated)
 	 				{
 	 				float ax, ay, az, gx, gy, gz;
 	 				float eax, eay, eaz, egx, egy, egz;
+	 				/*
 	 				ax = (float)(tac_x - mac_x) / acc_res;
 	 				ay = (float)(tac_y - mac_y) / acc_res;
 	 				az = (float)(tac_z - mac_z) / acc_res;
 	 				gx = (float)(tgy_x - mgy_x) / gyro_res;
 	 				gy = (float)(tgy_y - mgy_y) / gyro_res;
 	 				gz = (float)(tgy_z - mgy_z) / gyro_res;
-	 				eax = update_est_ax(ax);
-	 				eay = update_est_ax(ay);
-	 				eaz = update_est_ax(az);
-	 				egx = update_est_ax(gx);
-	 				egy = update_est_ax(gy);
-	 				egz = update_est_ax(gz); 
+	 				*/
+	 				ax = (float)(tac_x) / acc_res - mac_x;
+	 				ay = (float)(tac_y) / acc_res - mac_y;
+	 				az = (float)(tac_z) / acc_res - mac_z;
+	 				gx = (float)(tgy_x) / gyro_res - mgy_x;
+	 				gy = (float)(tgy_y) / gyro_res - mgy_y;
+	 				gz = (float)(tgy_z) / gyro_res - mgy_z;
+	 				eax = ksf_update_est(ax, &kf_ax);
+	 				eay = ksf_update_est(ay, &kf_ay);
+	 				eaz = ksf_update_est(az, &kf_az);
+	 				egx = ksf_update_est(gx, &kf_gx);
+	 				egy = ksf_update_est(gy, &kf_gy);
+	 				egz = ksf_update_est(gz, &kf_gz); 
 	 				//ESP_LOGI(TAG, "acc (dps): %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f gyro(m/sec2): %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f ", 
 	 				//	ax, eax, ay, eay, az, eaz, gx, egx, gy, egy, gz, egz);
-	 				my_printf("%8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f ", 
-	 					ax, eax, ay, eay, az, eaz, gx, egx, gy, egy, gz, egz);
+	 				my_printf("%10llu - %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f ", 
+	 					msg.vts.ts, ax, eax, ay, eay, az, eaz, gx, egx, gy, egy, gz, egz);
 	 				}
 	 			if(cal_state)
 	 				{
+					/*
+					enter calibration mode
+					MPU sensor is place horizontally with x axis parallel with vehicle body towards front
+					MPU sensor is facing down with z axis towards ground
+					expected values while steady:
+						acc x = 0
+						acc y = 0
+						acc z = -9.807 (default gravity field at 45deg lat)
+						gyro x = 0
+						gyro y = 0
+						gyro z = 0
+					calibration is done on the values converted with resolution
+					*/
 					if(samples < 5)
 						{
 						samples++;
@@ -301,10 +315,12 @@ void mpu_message_handler(void *pvParameters)
 						}
 					if(samples < nr_samples)
 						{
-						mac_x += tac_x; mac_y += tac_y; mac_z += tac_z;
-						mgy_x += tgy_x; mgy_y += tgy_y; mgy_z += tgy_z;
-						rac_x[samples - 5] = tac_x; rac_y[samples - 5] = tac_y; rac_z[samples - 5] = tac_z;
-						rgy_x[samples - 5] = tgy_x; rgy_y[samples - 5] = tgy_y; rgy_z[samples - 5] = tgy_z; 
+						mac_x += (float)tac_x / acc_res; 
+						mac_y += (float)tac_y / acc_res; 
+						mac_z += (float)tac_z / acc_res;
+						mgy_x += (float)tgy_x / gyro_res; 
+						mgy_y += (float)tgy_y / gyro_res; 
+						mgy_z += (float)tgy_z / gyro_res;
 						samples++;
 						}
 					else
@@ -314,26 +330,10 @@ void mpu_message_handler(void *pvParameters)
 						cal_state = 0;
 						mac_x /= samples; mac_y /= samples; mac_z /= samples;
 						mgy_x /= samples; mgy_y /= samples; mgy_z /= samples;
-						float sdac_x = 0, sdac_y = 0, sdac_z = 0, sdgy_x = 0, sdgy_y = 0, sdgy_z = 0;
-						for(int i = 0; i < samples; i++)
-							{
-							sdac_x += (rac_x[i] - mac_x) * (rac_x[i] - mac_x);
-							sdac_y += (rac_y[i] - mac_y) * (rac_y[i] - mac_y);
-							sdac_z += (rac_z[i] - mac_z) * (rac_z[i] - mac_z);
-							sdgy_x += (rgy_x[i] - mgy_x) * (rgy_x[i] - mgy_x);
-							sdgy_y += (rgy_y[i] - mgy_y) * (rgy_y[i] - mgy_y);
-							sdgy_z += (rgy_z[i] - mgy_z) * (rgy_z[i] - mgy_z); 
-							}
-						sdac_x = sqrt(sdac_x / (samples -1));
-						sdac_y = sqrt(sdac_y / (samples -1));
-						sdac_z = sqrt(sdac_z / (samples -1));
-						sdgy_x = sqrt(sdgy_x / (samples -1));
-						sdgy_y = sqrt(sdgy_y / (samples -1));
-						sdgy_z = sqrt(sdgy_z / (samples -1));
+						mac_z += 9.807;
 						calibrated = 1;
-						ESP_LOGI(TAG, "\noffset val nrs: %d\n\t%d, %d, %d, %d, %d, %d ", samples, mac_x, mac_y, mac_z, mgy_x, mgy_y, mgy_z);
-						ESP_LOGI(TAG, "\t%.3f, %.3f, %.3f, %.3f, %.3f, %.3f ", sdac_x, sdac_y, sdac_z, sdgy_x, sdgy_y, sdgy_z);
-						free(rac_x); free(rac_y); free(rac_z);	free(rgy_x); free(rgy_y); free(rgy_z);
+						ESP_LOGI(TAG, "\noffset val nrs: %d\n\t%f, %f, %f, %f, %f, %f ", samples, mac_x, mac_y, mac_z, mgy_x, mgy_y, mgy_z);
+						//ESP_LOGI(TAG, "\t%.3f, %.3f, %.3f, %.3f, %.3f, %.3f ", sdac_x, sdac_y, sdac_z, sdgy_x, sdgy_y, sdgy_z);
 						}
 					}
 				}
@@ -341,55 +341,10 @@ void mpu_message_handler(void *pvParameters)
 				{
 				mpu_activate(0);
 				nr_samples = msg.val;
-				rac_x = malloc(nr_samples * sizeof(int));
-				if(rac_x)
-					{
-					rac_y = malloc(nr_samples * sizeof(int));
-					if(rac_y)
-						{
-						rac_z = malloc(nr_samples * sizeof(int));
-						if(rac_z)
-							{
-							rgy_x = malloc(nr_samples * sizeof(int));
-							if(rgy_x)
-								{
-								rgy_y = malloc(nr_samples * sizeof(int));
-								if(rgy_y)
-									{
-									rgy_z = malloc(nr_samples * sizeof(int));
-									if(rgy_z)
-										{
-										samples = 0;
-										mac_x = 0, mac_y = 0, mac_z = 0, mgy_x = 0, mgy_y = 0, mgy_z = 0;
-										cal_state = 1;
-										calibrated = 0;
-										mpu_activate(1);
-										}
-									else
-										{
-										free(rac_x); free(rac_y); free(rac_z);	free(rgy_x); free(rgy_y);
-										}
-									}
-								else 
-									{
-									free(rac_x); free(rac_y); free(rac_z); free(rgy_x);
-									}
-								}
-							else
-								{
-								free(rac_x); free(rac_y); free(rac_z);
-								}
-							}
-						else
-							{
-							free(rac_x); free(rac_y);
-							}
-						}
-					else
-						{
-						free(rac_x);
-						}
-					}
+				mac_x = 0., mac_y = 0., mac_z = 0., mgy_x = 0., mgy_y = 0., mgy_z = 0.;
+				cal_state = 1;
+				calibrated = 0;
+				mpu_activate(1);
 				}
 			}
 		}
@@ -404,7 +359,6 @@ static void mpu_cal(int nrs)
 int do_mpu(int argc, char **argv)
 	{
 	int nrs;
-	msg_t msg;
 	if(strcmp(argv[0], command))
 		return 0;
 	int nerrors = arg_parse(argc, argv, (void **)&mpu_args);
@@ -428,26 +382,34 @@ int do_mpu(int argc, char **argv)
 			nrs = mpu_args.arg->ival[0];
 		else 
 			nrs = 100;
-		msg.source = 2;
-		msg.val = nrs;
-		xQueueSend(mpu_cmd_queue, &msg, pdMS_TO_TICKS(10));
+		mpu_cal(nrs);
 		}
 	else if(strcmp(mpu_args.op->sval[0], "kf") == 0)
 		{
-		
 		if(mpu_args.arg->count && mpu_args.arg1->count && mpu_args.arg2->count)
 			{
-			err_m = ((float)mpu_args.arg->ival[0])/1000.;
-			err_e = ((float)mpu_args.arg1->ival[0])/1000.;
-			p_noise = ((float)mpu_args.arg2->ival[0])/1000.;
-			kf_init_ax(err_m, err_e, p_noise);
-			kf_init_ay(err_m, err_e, p_noise);
-			kf_init_az(err_m, err_e, p_noise);
-			ESP_LOGI(TAG, "kf params: %f %f %f", err_m, err_e, p_noise);	
+			if(strcmp(mpu_args.op->sval[0], "kfax") == 0)
+				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_ax);
+			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_ay);
+			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_az);
+			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_gx);
+			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_gy);
+			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_gz);
 			}
 		else 
 			{
-			ESP_LOGI(TAG, "not enough parameters. Actual values: %f %f %f", err_m, err_e, p_noise);
+			ESP_LOGI(TAG, "Kalman simple filter. Actual values: \nax: %f %f %f\nay: %f %f %f\naz: %f %f %f\ngx: %f %f %f\ngy: %f %f %f\ngz: %f %f %f", 
+			kf_ax.err_m, kf_ax.err_e, kf_ax.p_noise, 
+			kf_ay.err_m, kf_ay.err_e, kf_ay.p_noise, 
+			kf_az.err_m, kf_az.err_e, kf_az.p_noise, 
+			kf_gx.err_m, kf_gx.err_e, kf_gx.p_noise, 
+			kf_gy.err_m, kf_gy.err_e, kf_gy.p_noise, 
+			kf_gz.err_m, kf_gz.err_e, kf_gz.p_noise);
 			}
 		}
 	return ESP_OK;
@@ -476,7 +438,8 @@ void register_mpu()
 	else if(acc_fs == 2) acc_res = 65536. / 16. / 9.807;
 	else if(acc_fs == 3) acc_res = 65536. / 32. / 9.807;
 	
-	mac_x = 0, mac_y = 0, mac_z = 0, mgy_x = 0, mgy_y = 0, mgy_z = 0;
+	//mac_x = 0, mac_y = 0, mac_z = 0, mgy_x = 0, mgy_y = 0, mgy_z = 0;
+	mac_x = CAL_FACT_AX, mac_y = CAL_FACT_AY, mac_z = CAL_FACT_AZ, mgy_x = CAL_FACT_GX, mgy_y = CAL_FACT_GY, mgy_z = CAL_FACT_GZ;
 	
 	//kf_init(me, ee, n);
 	
@@ -500,7 +463,7 @@ void register_mpu()
 		mpu_handle = NULL;
 		}
 	
-	mpu_args.op = arg_str1(NULL, NULL, "<op>", "op: activate | init | selftest");
+	mpu_args.op = arg_str1(NULL, NULL, "<op>", "op: activate | init | selftest | cal | ksf##");
 	mpu_args.arg = arg_int0(NULL, NULL, "<#>", "#0 | #1");
 	mpu_args.arg1 = arg_int0(NULL, NULL, "<#>", "#0 | #1");
 	mpu_args.arg2 = arg_int0(NULL, NULL, "<#>", "#0 | #1");
@@ -520,59 +483,10 @@ void register_mpu()
 		esp_restart();
 		}	
 	mpu_cal(100);
-	kf_init_ax(err_m, err_e, p_noise);
-	kf_init_ay(err_m, err_e, p_noise);
-	kf_init_az(err_m, err_e, p_noise);
-	}
-	
-//Kalman filter
-static void kf_init_ax(float m_error, float e_error, float pn)
-	{
-	err_m_ax = m_error;
-	err_e_ax = e_error;
-	p_noise_ax = pn;
-	l_est_ax = 0, k_gain_ax = 0;	
-	}
-	
-static float update_est_ax(float m)
-	{
-  	k_gain_ax = err_e_ax / (err_e_ax + err_m_ax);
-  	float c_est = l_est_ax + k_gain_ax * (m - l_est_ax);
-  	err_e_ax = (1.0f - k_gain_ax) * err_e_ax + fabsf(l_est_ax - c_est) * p_noise_ax;
-  	l_est_ax = c_est;
-  	return c_est;
-	}
-
-static void kf_init_ay(float m_error, float e_error, float pn)
-	{
-	err_m_ay = m_error;
-	err_e_ay = e_error;
-	p_noise_ay = pn;
-	l_est_ay = 0, k_gain_ay = 0;	
-	}
-	
-static float update_est_ay(float m)
-	{
-  	k_gain_ay = err_e_ay / (err_e_ay + err_m_ay);
-  	float c_est = l_est_ay + k_gain_ay * (m - l_est_ay);
-  	err_e_ay = (1.0f - k_gain_ay) * err_e_ay + fabsf(l_est_ay - c_est) * p_noise_ay;
-  	l_est_ay = c_est;
-  	return c_est;
-	}
-	
-static void kf_init_az(float m_error, float e_error, float pn)
-	{
-	err_m_az = m_error;
-	err_e_az = e_error;
-	p_noise_az = pn;
-	l_est_az = 0, k_gain_az = 0;	
-	}
-	
-static float update_est_az(float m)
-	{
-  	k_gain_az = err_e_az / (err_e_az + err_m_az);
-  	float c_est = l_est_az + k_gain_az * (m - l_est_az);
-  	err_e_az = (1.0f - k_gain_az) * err_e_az + fabsf(l_est_az - c_est) * p_noise_az;
-  	l_est_az = c_est;
-  	return c_est;
+	ksf_init(def_err_m, def_err_e, def_p_noise, &kf_ax);
+	ksf_init(def_err_m, def_err_e, def_p_noise, &kf_ay);
+	ksf_init(def_err_m, def_err_e, def_p_noise, &kf_az);
+	ksf_init(def_err_m, def_err_e, def_p_noise, &kf_gx);
+	ksf_init(def_err_m, def_err_e, def_p_noise, &kf_gy);
+	ksf_init(def_err_m, def_err_e, def_p_noise, &kf_gz);
 	}
