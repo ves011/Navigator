@@ -8,9 +8,15 @@
 #ifndef MAIN_PTST_H_
 #define MAIN_PTST_H_
 
+//decoder GPIOs
+#define DEC_LEFT_A			(6)
+#define DEC_LEFT_B			(5)
+#define DEC_RIGHT_A			(41)
+#define DEC_RIGHT_B			(42)
+//Motors control GPIOs
 #define ENLEFTM				(40)
 #define ENRIGHTM			(35)
-#define MOTEN_INTR			(41)
+//#define MOTEN_INTR			(41)
 #define LEFTM_CTRL1			(38)
 #define LEFTM_CTRL2			(39)
 #define RIGHTM_CTRL1		(36)
@@ -21,8 +27,11 @@
 #define SENSE_BAT			(3)			// IO4
 
 #define PT_ENABLED			100			//message source when enL or enR goues high
-										// sent by moten interrupt 
+#define DEC_SRC				101			// decoder left / right B message interrupt
+ 
 #define PTST_FILE					"ptst.txt"
+
+
 
 void register_ptst();
 int do_ptst(int argc, char **argv);

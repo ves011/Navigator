@@ -9,13 +9,23 @@
 #define MAIN_MPU6050_H_
 
 #define MPU_I2C_ADDRESS		0x68
-#define MPU_NOT_INIT		0
 #define MPU_INIT			1
 #define MPU_ACTIVE			2
 
 #define DEFAULT_GFS			1		// default gyro full scale = +-500 deg/sec
 #define DEFAULT_AFS			0		// default accel full scale = +-2g
+#define DEFAULT_DLPF		6		// DLPF filter 5Hz
 
+//msg.source values
+#define MPU_DRDY			1		// data ready interrupt
+#define MPU_CAL				2		// start calibration procedure
+
+#define MPU_DATA			1
+#define MPU_CMD				0x80
+#define MPU_CMD_DISP_VAL	0x81
+#define MPU_CMD_CAL			0x82
+
+// in the datasheet only registers starting 0x0d
 #define XGOFFS_TC			0x00 // Bit 7 PWR_MODE, bits 6:1 XG_OFFS_TC, bit 0 OTP_BNK_VLD
 #define YGOFFS_TC			0x01
 #define ZGOFFS_TC			0x02
@@ -28,7 +38,7 @@
 #define YA_OFFSET_L_TC		0x09
 #define ZA_OFFSET_H			0x0A
 #define ZA_OFFSET_L_TC		0x0B
-
+//------------------------------------------------------
 #define SELF_TEST_X			0x0D
 #define SELF_TEST_Y			0x0E
 #define SELF_TEST_Z			0x0F

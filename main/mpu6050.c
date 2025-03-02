@@ -45,8 +45,9 @@ static char *command = "mpu";
 
 static i2c_master_dev_handle_t mpu_handle;
 static QueueHandle_t mpu_cmd_queue = NULL;
-static int mpu_state = MPU_NOT_INIT;
+static int mpu_state = 0;
 static int acc_fs, gyro_fs;
+static int dlpf;
 static float acc_res, gyro_res;
 
 //means used to reduce the offsets
@@ -65,53 +66,42 @@ static void IRAM_ATTR mpu_drdy_isr(void* arg)
     uint32_t gpio_num = (uint32_t) arg;
     if(gpio_num == MPU_DRDY_PIN)
     	{
-		msg.source = 1;
+		msg.source = MPU_DATA;
 		msg.vts.ts = esp_timer_get_time();
 		xQueueSendFromISR(mpu_cmd_queue, &msg, NULL);
 		}
 	}
-static int mpu_activate(bool enable)
+
+static int mpu_enable_int(bool enable)
 	{
-	uint8_t wr_buf[2];
 	int ret = ESP_FAIL;
+	uint8_t wr_buf[4];	
 	if(enable)
 		{
-		if(mpu_state == MPU_NOT_INIT)
+		if(mpu_state != MPU_INIT)
 			{
 			ESP_LOGI(TAG, "Init MPU before to activate it");
 			}
-		else if(mpu_state == MPU_INIT)
+		else
 			{
 			//INT_ENABLE: enable drdy interrupt
 			wr_buf[0] = INT_ENABLE;
 			wr_buf[1] = 1;
 			if((ret = master_transmit(mpu_handle, wr_buf, 2)) == ESP_OK)
-				{
 				mpu_state = MPU_ACTIVE;
-				ret = ESP_OK;
-				}
 			}
 		}
 	else
 		{
-		if(mpu_state == MPU_ACTIVE)
-			{
-			//INT_ENABLE: disable interrupt
-			wr_buf[0] = INT_ENABLE;
-			wr_buf[1] = 0;
-			if((ret = master_transmit(mpu_handle, wr_buf, 2)) == ESP_OK)
-				{
-				mpu_state = MPU_INIT;
-				ret = ESP_OK;
-				}
-			}
-		else
-			{
-			ESP_LOGI(TAG, "MPU not in active state");
-			}
+		//INT_ENABLE: disable interrupt
+		wr_buf[0] = INT_ENABLE;
+		wr_buf[1] = 0;
+		if((ret = master_transmit(mpu_handle, wr_buf, 2)) == ESP_OK)
+			mpu_state = MPU_INIT;
 		}
 	return ret;
 	}
+
 static int mpu_self_test()
 	{
 	uint8_t wr_buf[10], rd_buf[10];
@@ -164,7 +154,7 @@ static int mpu_init()
 	{
 	uint8_t wr_buf[10], rd_buf[10];
 	int ret;
-	mpu_state = MPU_NOT_INIT;
+	mpu_state = 0;
 	//reset mpu6050
 	wr_buf[0] = PWR_MGMT_1;
  	wr_buf[1] = 0x80;
@@ -191,24 +181,19 @@ static int mpu_init()
 			 	wr_buf[1] = 100;
 			 	if((ret = master_transmit(mpu_handle, wr_buf, 2)) != ESP_OK)
 			 		goto error;
+
 			 	//CONFIG: fsync disabled, dlpf = 6 --> 0x06
 			 	wr_buf[0] = CONFIG;
-			 	wr_buf[1] = 0x06;
-			 	//if((ret = master_transmit(mpu_handle, wr_buf, 2)) != ESP_OK)
-			 	//	goto error;
-			 	
+			 	wr_buf[1] = dlpf & 7; //0x06;
+
 			 	//GYRO_CONFIG: default scale
-			 	//wr_buf[0] = GYRO_CONFIG;
 			 	wr_buf[2] = gyro_fs << 3;
+
 			 	//ACCEL_CONFIG: default scale
 			 	wr_buf[3] = acc_fs << 3;
 			 	if((ret = master_transmit(mpu_handle, wr_buf, 4)) != ESP_OK)
 			 		goto error;
-			 	//ACCEL_CONFIG: default scale
-			 	//wr_buf[0] = ACCEL_CONFIG;
-			 	//wr_buf[1] = DEFAULT_AFS << 3;
-			 	//if((ret = master_transmit(mpu_handle, wr_buf, 2)) != ESP_OK)
-			 	//	goto error;
+
 			 	//INT_PIN_CFG: int_rd_clear = 1 (int stat bits cleared on any read): 0x10
 			 	wr_buf[0] = INT_PIN_CFG;
 			 	wr_buf[1] = 1 << 4;
@@ -216,18 +201,10 @@ static int mpu_init()
 			 	wr_buf[2] = 0;
 			 	if((ret = master_transmit(mpu_handle, wr_buf, 3)) != ESP_OK)
 			 		goto error;
-			 	//INT_ENABLE: disable all interrupts
-			 	//wr_buf[0] = INT_ENABLE;
-			 	//wr_buf[1] = 0;
-			 	//if((ret = master_transmit(mpu_handle, wr_buf, 2)) != ESP_OK)
-			 	//	goto error;
 			 	mpu_state = MPU_INIT;
 		 		}
 			else
-				{
 		 		ESP_LOGI(TAG, "Bad MPU signature: %02x instead of 0x68 ", rd_buf[0]);
-		 		return ret;
-		 		}
 			}
 		}
 error:;
@@ -236,63 +213,73 @@ error:;
 void mpu_message_handler(void *pvParameters)
 	{
 	msg_t msg;
+	uint8_t disp_val = 0;
 	uint8_t wr_buf, rd_buf[20];
 	int tac_x, tac_y, tac_z, tgy_x, tgy_y, tgy_z;
 	int rtemp, samples = 0;
 	int nr_samples = 5;
 	int cal_state = 0, calibrated = 1;
+	float ax, ay, az, gx, gy, gz;
+	float eax, eay, eaz, egx, egy, egz;
 	while(1)
 		{
 		if(xQueueReceive(mpu_cmd_queue, &msg, pdMS_TO_TICKS(1500)))
 			{
 			//ESP_LOGI(TAG, "DRDY int");
-			if(msg.source == 1)
+			if(msg.source == MPU_DATA)
 				{
+				// read 14 values for acc x..z, temp. gyro x..z
 				wr_buf = ACCEL_XOUT_H;
 	 			master_transmit(mpu_handle, (uint8_t *)&wr_buf, 1);
 	 			master_receive(mpu_handle, (uint8_t *)rd_buf, 14);
 	 			//ESP_LOGI(TAG, "raw data: %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x, %x ", 
 	 			//			rd_buf[0], rd_buf[1], rd_buf[2], rd_buf[3], rd_buf[4], rd_buf[5], rd_buf[8], rd_buf[9], rd_buf[10], rd_buf[11], rd_buf[12], rd_buf[13]);
-	 			tac_x = TO_INT(rd_buf[0], rd_buf[1]);//int16_t)(((int16_t)rd_buf[0] << 8) | rd_buf[1]);
-	 			tac_y = TO_INT(rd_buf[2], rd_buf[3]);//(int16_t)(((int16_t)rd_buf[2] << 8) | rd_buf[3]);
-	 			tac_z = TO_INT(rd_buf[4], rd_buf[5]);//(int16_t)(((int16_t)rd_buf[4] << 8) | rd_buf[5]);
+	 			//temporary raw data
+	 			tac_x = TO_INT(rd_buf[0], rd_buf[1]);
+	 			tac_y = TO_INT(rd_buf[2], rd_buf[3]);
+	 			tac_z = TO_INT(rd_buf[4], rd_buf[5]);
 	 			
 	 			rtemp = (int16_t)(((int16_t)rd_buf[6] << 8) | rd_buf[7]);
 	 			
-	 			tgy_x = (int16_t)(((int16_t)rd_buf[8] << 8) | (int)rd_buf[9]);
-	 			tgy_y = (int16_t)(((int16_t)rd_buf[10] << 8) | (int)rd_buf[11]);
-	 			tgy_z = (int16_t)(((int16_t)rd_buf[12] << 8) | (int)rd_buf[13]);
-	 			if(!calibrated)
-	 				ESP_LOGI(TAG, "raw accel: %6d %6d %6d %6d raw gyro : %6d %6d %6d ",	tac_x, tac_y, tac_z, rtemp, tgy_x, tgy_y, tgy_z);
+	 			tgy_x = TO_INT(rd_buf[8], rd_buf[9]);
+	 			tgy_y = TO_INT(rd_buf[10], rd_buf[11]);
+	 			tgy_z = TO_INT(rd_buf[12], rd_buf[13]);
+	 			
+	 			ax = (float)(tac_x) / acc_res;
+	 			ay = (float)(tac_y) / acc_res;
+	 			az = -(float)(tac_z) / acc_res;
+	 			gx = (float)(tgy_x) / gyro_res;
+	 			gy = (float)(tgy_y) / gyro_res;
+	 			gz = (float)(tgy_z) / gyro_res;
+	 			
+	 			eax = ksf_update_est(ax, &kf_ax);
+ 				eay = ksf_update_est(ay, &kf_ay);
+ 				eaz = ksf_update_est(az, &kf_az);
+ 				egx = ksf_update_est(gx, &kf_gx);
+ 				egy = ksf_update_est(gy, &kf_gy);
+ 				egz = ksf_update_est(gz, &kf_gz); 
+	 			//if(!calibrated)
+	 			//	ESP_LOGI(TAG, "raw accel: %6d %6d %6d %6d raw gyro : %6d %6d %6d ",	tac_x, tac_y, tac_z, rtemp, tgy_x, tgy_y, tgy_z);
 	 			if(calibrated)
 	 				{
-	 				float ax, ay, az, gx, gy, gz;
-	 				float eax, eay, eaz, egx, egy, egz;
-	 				/*
-	 				ax = (float)(tac_x - mac_x) / acc_res;
-	 				ay = (float)(tac_y - mac_y) / acc_res;
-	 				az = (float)(tac_z - mac_z) / acc_res;
-	 				gx = (float)(tgy_x - mgy_x) / gyro_res;
-	 				gy = (float)(tgy_y - mgy_y) / gyro_res;
-	 				gz = (float)(tgy_z - mgy_z) / gyro_res;
-	 				*/
-	 				ax = (float)(tac_x) / acc_res - mac_x;
-	 				ay = (float)(tac_y) / acc_res - mac_y;
-	 				az = (float)(tac_z) / acc_res - mac_z;
-	 				gx = (float)(tgy_x) / gyro_res - mgy_x;
-	 				gy = (float)(tgy_y) / gyro_res - mgy_y;
-	 				gz = (float)(tgy_z) / gyro_res - mgy_z;
-	 				eax = ksf_update_est(ax, &kf_ax);
-	 				eay = ksf_update_est(ay, &kf_ay);
-	 				eaz = ksf_update_est(az, &kf_az);
-	 				egx = ksf_update_est(gx, &kf_gx);
-	 				egy = ksf_update_est(gy, &kf_gy);
-	 				egz = ksf_update_est(gz, &kf_gz); 
+	 				eax -= mac_x; eay -= mac_y;	eaz -=mac_z;
+	 				egx -= mgy_x; egy -= mgy_y;	egz -= mgy_z;
+	 				msg.source = SENSOR_DATA;
+	 				msg.val = MPU_SENSOR_DATA;
+	 				msg.ifvals.fval[0] = eax; msg.ifvals.fval[1] = eay; msg.ifvals.fval[2] = eaz;
+	 				msg.ifvals.fval[3] = egx; msg.ifvals.fval[4] = egy; msg.ifvals.fval[5] = egz; 
+	 				xQueueSend(dev_mon_queue, &msg, pdMS_TO_TICKS(10));
+	 				} 
 	 				//ESP_LOGI(TAG, "acc (dps): %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f gyro(m/sec2): %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f ", 
 	 				//	ax, eax, ay, eay, az, eaz, gx, egx, gy, egy, gz, egz);
-	 				my_printf("%10llu - %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f ", 
-	 					msg.vts.ts, ax, eax, ay, eay, az, eaz, gx, egx, gy, egy, gz, egz);
+	 				//my_printf("%10llu - %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f %8.5f ", 
+	 				//	msg.vts.ts, ax, eax, ay, eay, az, eaz, gx, egx, gy, egy, gz, egz);
+	 			if(disp_val)
+	 				{
+		 			my_printf("%10llu %10.5f %10.5f %10.5f %10.5f %10.5f %10.5f ", 
+		 				msg.vts.ts, eax, eay, eaz, egx, egy, egz);
 	 				}
+
 	 			if(cal_state)
 	 				{
 					/*
@@ -300,14 +287,11 @@ void mpu_message_handler(void *pvParameters)
 					MPU sensor is place horizontally with x axis parallel with vehicle body towards front
 					MPU sensor is facing down with z axis towards ground
 					expected values while steady:
-						acc x = 0
-						acc y = 0
-						acc z = -9.807 (default gravity field at 45deg lat)
-						gyro x = 0
-						gyro y = 0
-						gyro z = 0
+						acc x = 0 acc y = 0	acc z = -9.807 (default gravity field at 45deg lat)
+						gyro x = 0 gyro y = 0 gyro z = 0
 					calibration is done on the values converted with resolution
 					*/
+					//ignore first 5 samples
 					if(samples < 5)
 						{
 						samples++;
@@ -315,36 +299,39 @@ void mpu_message_handler(void *pvParameters)
 						}
 					if(samples < nr_samples)
 						{
-						mac_x += (float)tac_x / acc_res; 
-						mac_y += (float)tac_y / acc_res; 
-						mac_z += (float)tac_z / acc_res;
-						mgy_x += (float)tgy_x / gyro_res; 
-						mgy_y += (float)tgy_y / gyro_res; 
-						mgy_z += (float)tgy_z / gyro_res;
+						mac_x += eax; mac_y += eay;	mac_z += eaz; 
+						mgy_x += egx; mgy_y += egy; mgy_z += egz;
 						samples++;
 						}
 					else
 						{
-						mpu_activate(0);
+						msg_t msg;
 						samples -= 5;
-						cal_state = 0;
 						mac_x /= samples; mac_y /= samples; mac_z /= samples;
 						mgy_x /= samples; mgy_y /= samples; mgy_z /= samples;
 						mac_z += 9.807;
 						calibrated = 1;
+						cal_state = 0;
+						msg.source = INIT_COMPLETE;
+						xQueueSend(dev_mon_queue, &msg, pdMS_TO_TICKS(10));
 						ESP_LOGI(TAG, "\noffset val nrs: %d\n\t%f, %f, %f, %f, %f, %f ", samples, mac_x, mac_y, mac_z, mgy_x, mgy_y, mgy_z);
 						//ESP_LOGI(TAG, "\t%.3f, %.3f, %.3f, %.3f, %.3f, %.3f ", sdac_x, sdac_y, sdac_z, sdgy_x, sdgy_y, sdgy_z);
 						}
 					}
 				}
-			else if(msg.source == 2) // start calibration 
+			else if(msg.source == MPU_CMD)
 				{
-				mpu_activate(0);
-				nr_samples = msg.val;
-				mac_x = 0., mac_y = 0., mac_z = 0., mgy_x = 0., mgy_y = 0., mgy_z = 0.;
-				cal_state = 1;
-				calibrated = 0;
-				mpu_activate(1);
+				if(msg.val == MPU_CMD_CAL) // start calibration 
+					{
+					nr_samples = msg.vts.m_val[0];
+					mac_x = 0., mac_y = 0., mac_z = 0., mgy_x = 0., mgy_y = 0., mgy_z = 0.;
+					cal_state = 1;
+					calibrated = 0;
+					}
+				else if(msg.val == MPU_CMD_DISP_VAL) // start calibration 
+					{
+					disp_val = msg.vts.m_val[0];
+					}
 				}
 			}
 		}
@@ -352,13 +339,15 @@ void mpu_message_handler(void *pvParameters)
 static void mpu_cal(int nrs)
 	{
 	msg_t msg;
-	msg.source = 2;
-	msg.val = nrs;
+	msg.source = MPU_CMD;
+	msg.val = MPU_CMD_CAL;
+	msg.vts.m_val[0] = nrs;
 	xQueueSend(mpu_cmd_queue, &msg, pdMS_TO_TICKS(10));
 	}
 int do_mpu(int argc, char **argv)
 	{
 	int nrs;
+	msg_t msg;
 	if(strcmp(argv[0], command))
 		return 0;
 	int nerrors = arg_parse(argc, argv, (void **)&mpu_args);
@@ -368,14 +357,36 @@ int do_mpu(int argc, char **argv)
 		return ESP_FAIL;
 		}
 	if(strcmp(mpu_args.op->sval[0], "init") == 0)
-		mpu_init();
-	else if(strcmp(mpu_args.op->sval[0], "activate") == 0)
 		{
-		if(mpu_args.arg->count)
-			mpu_activate(mpu_args.arg->ival[0]);
+		mpu_init();
+		mpu_enable_int(true);
 		}
+
 	else if(strcmp(mpu_args.op->sval[0], "selftest") == 0)
+		{
+		mpu_enable_int(false);
 		mpu_self_test();
+		mpu_enable_int(true);
+		}
+	else if(strcmp(mpu_args.op->sval[0], "cont") == 0)
+		{
+		msg.source = MPU_CMD;
+		msg.val = MPU_CMD_DISP_VAL;
+		if(mpu_args.arg->count)
+			 msg.vts.m_val[0] = mpu_args.arg->ival[0];
+		else
+			msg.vts.m_val[0] = 1;
+		xQueueSend(mpu_cmd_queue, &msg, pdMS_TO_TICKS(10));
+		}
+	else if(strcmp(mpu_args.op->sval[0], "mon") == 0)
+		{
+		msg.source = MON_SHOW_DATA;
+		if(mpu_args.arg->count)
+			msg.val = mpu_args.arg->ival[0];
+		else
+			msg.val = 1;
+		xQueueSend(dev_mon_queue, &msg, pdMS_TO_TICKS(10));
+		}
 	else if(strcmp(mpu_args.op->sval[0], "cal") == 0)
 		{
 		if(mpu_args.arg->count)
@@ -392,13 +403,13 @@ int do_mpu(int argc, char **argv)
 				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_ax);
 			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
 				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_ay);
-			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+			else if(strcmp(mpu_args.op->sval[0], "kfaz") == 0)
 				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_az);
-			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+			else if(strcmp(mpu_args.op->sval[0], "kfgx") == 0)
 				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_gx);
-			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+			else if(strcmp(mpu_args.op->sval[0], "kfgy") == 0)
 				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_gy);
-			else if(strcmp(mpu_args.op->sval[0], "kfay") == 0)
+			else if(strcmp(mpu_args.op->sval[0], "kfgz") == 0)
 				ksf_init(((float)mpu_args.arg->ival[0])/1000., ((float)mpu_args.arg1->ival[0])/1000., ((float)mpu_args.arg2->ival[0])/1000., &kf_gz);
 			}
 		else 
@@ -412,22 +423,38 @@ int do_mpu(int argc, char **argv)
 			kf_gz.err_m, kf_gz.err_e, kf_gz.p_noise);
 			}
 		}
+	else if(strcmp(mpu_args.op->sval[0], "dlpf") == 0)
+		{
+		if(mpu_args.arg->count)
+			{
+			dlpf = mpu_args.arg->ival[0];
+			mpu_init();
+			}
+		else 
+			ESP_LOGI(TAG, "DLPF = %d", dlpf);
+		}
 	return ESP_OK;
 	}
 void register_mpu()
 	{
 	gpio_config_t io_conf;
+	mpu_cmd_queue = xQueueCreate(10, sizeof(msg_t));
+	if(!mpu_cmd_queue)
+		{
+		ESP_LOGE(TAG, "cannot create mpu_cmd_queue");
+		esp_restart();
+		}
 	io_conf.intr_type = GPIO_INTR_POSEDGE;
 	io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pin_bit_mask = (1ULL << MPU_DRDY_PIN);
     io_conf.pull_down_en = 0;
     io_conf.pull_up_en = 1;
     gpio_config(&io_conf);
-    //gpio_install_isr_service(0);
     gpio_isr_handler_add(MPU_DRDY_PIN, mpu_drdy_isr, (void*) MPU_DRDY_PIN);
-    mpu_cmd_queue = xQueueCreate(10, sizeof(msg_t));
+
 	acc_fs = DEFAULT_AFS;
 	gyro_fs = DEFAULT_GFS;
+	dlpf = DEFAULT_DLPF;
 	if(gyro_fs == 0) gyro_res = 65536./500.;
 	else if(gyro_fs == 1) gyro_res = 65536./1000.;
 	else if(gyro_fs == 2) gyro_res = 65536./2000.;
@@ -438,8 +465,8 @@ void register_mpu()
 	else if(acc_fs == 2) acc_res = 65536. / 16. / 9.807;
 	else if(acc_fs == 3) acc_res = 65536. / 32. / 9.807;
 	
-	//mac_x = 0, mac_y = 0, mac_z = 0, mgy_x = 0, mgy_y = 0, mgy_z = 0;
-	mac_x = CAL_FACT_AX, mac_y = CAL_FACT_AY, mac_z = CAL_FACT_AZ, mgy_x = CAL_FACT_GX, mgy_y = CAL_FACT_GY, mgy_z = CAL_FACT_GZ;
+	mac_x = 0, mac_y = 0, mac_z = 0, mgy_x = 0, mgy_y = 0, mgy_z = 0;
+	//mac_x = CAL_FACT_AX, mac_y = CAL_FACT_AY, mac_z = CAL_FACT_AZ, mgy_x = CAL_FACT_GX, mgy_y = CAL_FACT_GY, mgy_z = CAL_FACT_GZ;
 	
 	//kf_init(me, ee, n);
 	
@@ -456,6 +483,7 @@ void register_mpu()
 		ESP_LOGI(TAG, "MPU@%x found", MPU_I2C_ADDRESS);
 		mpu_init();
 		mpu_self_test();
+		mpu_enable_int(true);
 		}
 	else 
 		{

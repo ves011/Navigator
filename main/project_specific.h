@@ -9,6 +9,7 @@
 #define MAIN_PROJECT_SPECIFIC_H_
 
 #define MDNS
+#define USE_I2C
 
 #define ACTIVE_CONTROLLER			(NAVIGATOR)
 
@@ -31,12 +32,29 @@
 #define TCPCOMMPORT			10001
 
 #define BAT_ADC_CHANNEL		3
+#define ADC_CHN_0			0
+#define ADC_CHN_1			1
+#define ADC_CHN_2			3
 
 
 #define WIFI_STA_ON 		(1)
 #define MQTT_PUBLISH		(0)
 
 #define TCP_CLIENT_SERVER
+
+/*
+Message definitions for device monitor queue
+*/
+#define MSG_WIFI			1	// wifi connect (.val = 1)/disconnect (.val = 0) event 
+#define MSG_BAT				2	// battery level .val = ADC battery measurement * 1000
+#define MSG_LED_FLASH		3	// nw state and remote state flashing
+#define NW_STATE_CHANGE		4	// nw connected (.val = 1) / disconnected (.val = 0)
+#define REMOTE_STATE_CHANGE	5	// remote connected (.val = 1) / disconnected (.val = 0)
+#define INIT_COMPLETE		6	// init completed
+#define SENSOR_DATA			7	// data form sensors
+#define MPU_SENSOR_DATA		8	// data from MPU
+#define HMC_SENSOR_DATA		9	// data from HMC
+#define MON_SHOW_DATA		10  // 
 
 typedef struct 
 	{
